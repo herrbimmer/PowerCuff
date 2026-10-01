@@ -61,6 +61,44 @@ enum ProcGroup {
     }
 }
 
+// MARK: - Watchdog
+
+/// A small shell that outlives the app however it dies (SIGKILL, crash, SIGTERM) and then puts everything back:
+/// resumes throttled processes and, through the app binary, restores the display brightness. Shared by every
+/// owner of a lever; it stops once the last one lets go.
+final class SafetyWatchdog: @unchecked Sendable {
+    static let shared = SafetyWatchdog()
+    private let lock = NSLock()
+    private var owners: Set<String> = []
+    private var process: Process?
+
+    /// The executable that restores brightness (`--restore-brightness`); only the real app bundle qualifies.
+    private static var restoreExecutable: String {
+        Bundle.main.bundleIdentifier == "com.powercuff.app" ? (Bundle.main.executablePath ?? "") : ""
+    }
+
+    func acquire(_ owner: String) {
+        lock.lock(); defer { lock.unlock() }
+        owners.insert(owner)
+        guard process == nil || process?.isRunning == false else { return }
+        // Entries in the state file are pids or negative pgids; `kill -CONT -- -N` resumes a whole group.
+        let script = #"P=$1; F=$2; B=$3; while kill -0 $P 2>/dev/null; do sleep 0.5; done; for u in $(cat "$F" 2>/dev/null); do kill -CONT -- $u 2>/dev/null; case $u in -*) for q in $(pgrep -g ${u#-}); do taskpolicy -B -p $q 2>/dev/null; done;; *) taskpolicy -B -p $u 2>/dev/null;; esac; done; [ -n "$B" ] && [ -x "$B" ] && "$B" --restore-brightness"#
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script, "sh", String(getpid()), ThrottleSafety.stateFile, Self.restoreExecutable]
+        p.standardOutput = nil; p.standardError = nil
+        if (try? p.run()) != nil { process = p }
+    }
+
+    func release(_ owner: String) {
+        lock.lock(); defer { lock.unlock() }
+        owners.remove(owner)
+        guard owners.isEmpty else { return }
+        process?.terminate()
+        process = nil
+    }
+}
+
 // MARK: - Engine
 
 public struct ThrottleOrder: Sendable, Equatable {
@@ -84,7 +122,6 @@ public final class ThrottleEngine: @unchecked Sendable {
     private var allowed: [pid_t: Bool] = [:]
     private var backgrounded: [pid_t: pid_t] = [:]        // pid -> unit
     private var timer: DispatchSourceTimer?
-    private var watchdog: Process?
     private var stopped = false
     private var generation = 0
     private let period = 0.1
@@ -111,7 +148,7 @@ public final class ThrottleEngine: @unchecked Sendable {
         queue.sync {
             self.stopped = true
             self.applyLocked([:], protected: [], skipNames: [])
-            self.stopWatchdog()
+            SafetyWatchdog.shared.release("throttle")
             try? FileManager.default.removeItem(atPath: ThrottleSafety.stateFile)
         }
     }
@@ -128,7 +165,13 @@ public final class ThrottleEngine: @unchecked Sendable {
         orders = new
         for (unit, o) in new where !o.background { unbackground(unit) }
         if !stopped && changed { ThrottleSafety.publish(Array(orders.keys)) }
-        if orders.isEmpty { timer?.cancel(); timer = nil } else { startTimer(); startWatchdog() }
+        if orders.isEmpty {
+            timer?.cancel(); timer = nil
+            SafetyWatchdog.shared.release("throttle")
+        } else {
+            startTimer()
+            SafetyWatchdog.shared.acquire("throttle")
+        }
     }
 
     private func release(_ unit: pid_t) {
@@ -216,21 +259,5 @@ public final class ThrottleEngine: @unchecked Sendable {
             guard let self, self.generation == gen, !self.stopped else { return }
             body(self)
         }
-    }
-
-    private func startWatchdog() {
-        guard watchdog == nil else { return }
-        // Entries are pids or negative pgids; `kill -CONT -- -N` resumes a whole group.
-        let script = #"P=$1; F=$2; while kill -0 $P 2>/dev/null; do sleep 0.5; done; for u in $(cat "$F" 2>/dev/null); do kill -CONT -- $u 2>/dev/null; case $u in -*) for q in $(pgrep -g ${u#-}); do taskpolicy -B -p $q 2>/dev/null; done;; *) taskpolicy -B -p $u 2>/dev/null;; esac; done"#
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", script, "sh", String(getpid()), ThrottleSafety.stateFile]
-        p.standardOutput = nil; p.standardError = nil
-        if (try? p.run()) != nil { watchdog = p }
-    }
-
-    private func stopWatchdog() {
-        watchdog?.terminate()
-        watchdog = nil
     }
 }

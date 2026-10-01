@@ -51,6 +51,7 @@ final class PowerModel {
     @ObservationIgnored private var controlPeriod = 0.0
     @ObservationIgnored private let shared = SharedConfig()
     @ObservationIgnored private var lastPublish = Date.distantPast
+    @ObservationIgnored private var lastWallFactor = 1.1
     @ObservationIgnored private var displayTimer: Timer?
     @ObservationIgnored private var persistTask: Task<Void, Never>?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
@@ -186,7 +187,7 @@ final class PowerModel {
         defaults.set(capW, forKey: "capW")
         observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         observers = []
-        shared.kill()
+        shared.setLive(false)
         governor.shutdown()
     }
 
@@ -222,6 +223,7 @@ final class PowerModel {
     /// Before sleep nothing may stay frozen.
     private func pause() {
         isSleeping = true
+        shared.setLive(false)
         controlTimer?.cancel(); controlTimer = nil
         displayTimer?.invalidate(); displayTimer = nil
         controlQueue.async { [governor] in governor.releaseThrottles() }
@@ -230,6 +232,7 @@ final class PowerModel {
     private func resume() {
         guard !isShutDown else { return }
         isSleeping = false
+        shared.setLive(true)
         controlTimer?.cancel()
         controlTimer = nil
         controlQueue.async { [self] in controlTick() }
@@ -298,8 +301,20 @@ final class PowerModel {
         lastPublish = Date()
     }
 
-    private func publish(snapshot snap: PowerSnapshot?) {
+    private func publish(snapshot raw: PowerSnapshot?) {
         guard !isShutDown else { return }
+        var snap = raw
+        if var s = raw {
+            if s.dcInW > 1 { lastWallFactor = s.wallFactor }
+            // With the adapter switched off the wall reads zero; show what it would draw.
+            if report.levers.onBattery, s.dcInW < 1 {
+                s.externalConnected = true
+                s.batteryW = -s.systemW
+                s.wallW = s.systemW * lastWallFactor
+                s.peakW = s.wallW
+                snap = s
+            }
+        }
         snapshot = snap
         guard let s = snap else { return }
         // History runs at most 1 point/s so the 2-minute chart looks the same at any refresh rate.
@@ -308,4 +323,17 @@ final class PowerModel {
         let cutoff = s.date.addingTimeInterval(-Self.historySpan)
         if let first = history.first, first.date < cutoff { history.removeAll { $0.date < cutoff } }
     }
+}
+
+/// Settings handed from the main actor to the control queue.
+final class SharedConfig: @unchecked Sendable {
+    private let lock = NSLock()
+    private var config = GovernorConfig()
+    private var front: pid_t?
+    private var live = true
+
+    func set(_ c: GovernorConfig) { lock.lock(); config = c; lock.unlock() }
+    func setFront(_ p: pid_t?) { lock.lock(); front = p; lock.unlock() }
+    func setLive(_ on: Bool) { lock.lock(); live = on; lock.unlock() }
+    func get() -> (GovernorConfig, pid_t?, Bool) { lock.lock(); defer { lock.unlock() }; return (config, front, live) }
 }

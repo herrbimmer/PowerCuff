@@ -79,7 +79,12 @@ public final class DisplayDimmer {
         guard let backend, let cur = backend.get() else { return false }
         adoptExternalChange(cur)
         guard cur > floor + 0.005 else { return false }
-        if userLevel == nil { userLevel = cur; persist() }
+        if userLevel == nil {
+            userLevel = cur
+            persist()
+            // The app can die while the screen is dimmed: arm the watchdog that puts it back.
+            if defaults != nil { SafetyWatchdog.shared.acquire("display") }
+        }
         let v = max(floor, cur - step)
         backend.set(v)
         lastSet = v
@@ -109,6 +114,14 @@ public final class DisplayDimmer {
         userLevel = nil
         lastSet = nil
         persist()
+        if defaults != nil { SafetyWatchdog.shared.release("display") }
+    }
+
+    /// For `PowerCuff --restore-brightness`, run by the watchdog after the app died while dimming.
+    public static func restoreSaved(defaults: UserDefaults = .standard) {
+        guard let saved = defaults.object(forKey: key) as? Double else { return }
+        BuiltInDisplay()?.set(saved)
+        defaults.removeObject(forKey: key)
     }
 
     private func persist() {

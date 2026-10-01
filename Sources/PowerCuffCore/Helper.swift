@@ -197,3 +197,44 @@ public final class HelperLink: @unchecked Sendable {
         }
     }
 }
+
+/// Scripts run as root (through the standard authorization dialog) to install or remove the helper daemon.
+public enum HelperInstall {
+    private static func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+    public static var plist: String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+        "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>\
+        <key>Label</key><string>\(HelperProtocol.label)</string>\
+        <key>ProgramArguments</key><array><string>\(HelperProtocol.installedBinary)</string></array>\
+        <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\
+        <key>StandardErrorPath</key><string>/Library/Logs/PowerCuffHelper.log</string>\
+        </dict></plist>
+        """
+    }
+
+    public static func installScript(helper: String) -> String {
+        let bin = HelperProtocol.installedBinary, plistPath = HelperProtocol.plistPath
+        return [
+            "set -e",
+            "launchctl bootout system/\(HelperProtocol.label) 2>/dev/null || true",
+            "mkdir -p /Library/PrivilegedHelperTools",
+            "cp -f \(quote(helper)) \(bin)",
+            "chown root:wheel \(bin)",
+            "chmod 755 \(bin)",
+            "printf '%s' \(quote(plist)) > \(plistPath)",
+            "chown root:wheel \(plistPath)",
+            "chmod 644 \(plistPath)",
+            "launchctl bootstrap system \(plistPath)",
+        ].joined(separator: "; ")
+    }
+
+    /// Stopping the daemon makes it undo every lever it holds before it exits.
+    public static var uninstallScript: String {
+        [
+            "launchctl bootout system/\(HelperProtocol.label) 2>/dev/null || true",
+            "rm -f \(HelperProtocol.installedBinary) \(HelperProtocol.plistPath)",
+        ].joined(separator: "; ")
+    }
+}

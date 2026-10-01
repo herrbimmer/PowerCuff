@@ -21,8 +21,12 @@ public struct ReductionController: Sendable {
         self.kUp = kUp; self.kDown = kDown; self.kp = kp; self.lookahead = lookahead
     }
 
-    /// - Parameter freeze: hold the integral (anti-windup) while the target is unreachable.
-    public mutating func update(controlledW: Double, targetW: Double, dt: Double, freeze: Bool = false) -> Double {
+    /// - Parameters:
+    ///   - freeze: hold the integral (anti-windup) while the target is unreachable.
+    ///   - limit: watts the plant can actually shed. The integral never exceeds it, so a long overshoot can't
+    ///     wind up a demand that nothing can satisfy (which would then take ages to unwind and undershoot).
+    public mutating func update(controlledW: Double, targetW: Double, dt: Double, freeze: Bool = false,
+                                limit: Double? = nil) -> Double {
         let slope = last.map { (controlledW - $0) / max(dt, 0.05) } ?? 0
         last = controlledW
         let err = controlledW + lookahead * max(slope, 0) - targetW
@@ -30,6 +34,7 @@ public struct ReductionController: Sendable {
             integral += (err > 0 ? kUp : kDown) * err * dt
             integral = min(max(integral, 0), maxIntegral)
         }
+        if let limit { integral = min(integral, max(limit, 0)) }
         return integral + kp * max(err, 0)
     }
 

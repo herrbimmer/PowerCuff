@@ -11,11 +11,14 @@ swift scripts/make_icons.swift "$ICON_SRC" "$OUT/icons"
 iconutil -c icns "$OUT/icons/AppIcon.iconset" -o "$OUT/icons/AppIcon.icns"
 
 swift build -c release
-BIN="$(swift build -c release --show-bin-path)/PowerCuff"
+BINDIR="$(swift build -c release --show-bin-path)"
+BIN="$BINDIR/PowerCuff"
+HELPER="$BINDIR/PowerCuffHelper"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/PowerCuff"
+cp "$HELPER" "$APP/Contents/MacOS/PowerCuffHelper"   # copied to /Library/PrivilegedHelperTools on "Install helper"
 cp Support/Info.plist "$APP/Contents/Info.plist"
 cp "$OUT/icons/AppIcon.icns" "$OUT/icons/MenuBarIcon.png" "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
