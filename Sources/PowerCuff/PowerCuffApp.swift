@@ -2,7 +2,19 @@ import SwiftUI
 import AppKit
 import PowerCuffCore
 
+/// Entry point. `--restore-brightness` is run by the safety watchdog after the app died while the display was
+/// dimmed: put the backlight back and exit without starting anything else.
 @main
+enum Launcher {
+    static func main() {
+        if CommandLine.arguments.contains("--restore-brightness") {
+            DisplayDimmer.restoreSaved()
+            exit(0)
+        }
+        PowerCuffApp.main()
+    }
+}
+
 struct PowerCuffApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var model = PowerModel.shared

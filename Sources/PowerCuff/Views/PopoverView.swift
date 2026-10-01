@@ -65,7 +65,7 @@ private struct HeaderView: View {
             Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 32, height: 32)
             VStack(alignment: .leading, spacing: 0) {
                 Text("PowerCuff").font(.headline)
-                Text(model.enabled ? "Cap active" : "Monitoring only")
+                Text(model.enabled ? (model.strict ? "Strict cap active" : "Cap active") : "Monitoring only")
                     .font(.caption).foregroundStyle(.secondary)
                     .contentTransition(.interpolate)
             }
@@ -113,6 +113,15 @@ private struct CapControl: View {
                    in: PowerModel.capRange, step: 1)
                 .tint(model.tint)
             ChipRow(model: model)
+            HStack(spacing: 6) {
+                Image(systemName: "scope").font(.caption).foregroundStyle(.secondary)
+                Text("Strict").font(.caption.weight(.medium))
+                Text("hold peaks, not just the average").font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                Spacer()
+                Toggle("", isOn: Binding(get: { model.strict }, set: { model.setStrict($0) }))
+                    .toggleStyle(.switch).controlSize(.mini).labelsHidden().tint(model.tint)
+            }
+            .padding(.top, 2)
         }
     }
 }
@@ -157,9 +166,20 @@ private struct StatusBanner: View {
         case .noData: return ("exclamationmark.triangle", "No power data.", Palette.warn)
         case .underCap: return ("checkmark.circle.fill", "Under the cap. Nothing throttled.", Palette.ok)
         case .limiting(let n):
-            return ("gauge.with.dots.needle.67percent", "Holding \(cap) W: throttling \(n) process\(n == 1 ? "" : "es").", Palette.accent)
+            let lv = model.report.levers
+            var parts: [String] = []
+            if n > 0 { parts.append("\(n) process\(n == 1 ? "" : "es") throttled") }
+            if lv.chargePaused { parts.append("charging paused") }
+            if let d = lv.dimmedTo { parts.append("display \(Int((d * 100).rounded()))%") }
+            if lv.lowPower { parts.append("Low Power Mode") }
+            if lv.onBattery { parts.append("running from battery") }
+            let what = parts.isEmpty ? "limiting" : parts.joined(separator: " · ")
+            return ("gauge.with.dots.needle.67percent", "Holding \(cap) W: \(what).", Palette.accent)
         case .cannotReach:
-            return ("exclamationmark.triangle.fill", "Can't reach \(cap) W: remaining load (display, GPU, idle floor) isn't throttleable.", Palette.hot)
+            let charging = model.snapshot.map { $0.onAC && $0.batteryW > 2 ? Int($0.batteryW.rounded()) : 0 } ?? 0
+            let why = charging > 0 ? "battery charging takes \(charging) W" : "remaining load (display, GPU, idle floor) isn't throttleable"
+            let hint = model.helperInstalled ? "" : " Install the helper (⚙) to pause charging."
+            return ("exclamationmark.triangle.fill", "Can't reach \(cap) W: \(why).\(hint)", Palette.hot)
         }
     }
 
@@ -190,10 +210,10 @@ private struct TilesGrid: View {
                     Tile(title: "Source", value: s.onAC ? "AC adapter" : "Battery",
                          sub: s.onAC ? (s.adapterName ?? "Unknown") : "unplugged")
                     Tile(title: "Adapter", value: s.adapterRatedW.map { "\(Int($0)) W" } ?? "—",
-                         sub: s.adapterVolts.map { String(format: "%.0f V", $0) })
+                         sub: adapterSub(s))
                     Tile(title: "Wall (est.)", value: s.onAC ? fmt(s.wallW) : "—",
-                         sub: s.onAC ? "\(Int(max(0, (s.adapterRatedW ?? 0) - s.wallW))) W spare" : nil,
-                         tint: s.onAC && s.adapterRatedW != nil && s.wallW > (s.adapterRatedW ?? 0) ? Palette.hot : .primary)
+                         sub: s.onAC ? "peak \(Int(s.peakW.rounded())) W" : nil,
+                         tint: s.onAC && s.adapterRatedW != nil && s.dcInW > (s.adapterRatedW ?? 0) ? Palette.hot : .primary)
                     Tile(title: "System", value: fmt(s.systemW), sub: "SoC + display")
                     Tile(title: batteryTitle(s), value: fmt(abs(s.batteryW)), sub: batterySub(s),
                          tint: s.batteryW < -0.5 ? Palette.warn : .primary)
@@ -204,6 +224,12 @@ private struct TilesGrid: View {
     }
 
     private func fmt(_ w: Double) -> String { String(format: "%.1f W", w) }
+
+    private func adapterSub(_ s: PowerSnapshot) -> String? {
+        guard let v = s.adapterVolts else { return nil }
+        let volts = String(format: "%.0f V", v)
+        return s.adapterSpareW.map { "\(volts) · \(Int($0.rounded())) spare" } ?? volts
+    }
 
     private func batteryTitle(_ s: PowerSnapshot) -> String {
         s.batteryW > 0.5 ? "Charging" : (s.batteryW < -0.5 ? "Battery draw" : "Battery")
@@ -285,6 +311,9 @@ struct ProcessListView: View {
     private func row(_ p: ProcRow) -> some View {
         HStack(spacing: 6) {
             Text(p.name).lineLimit(1)
+            if p.background {
+                Image(systemName: "leaf.fill").font(.caption2).foregroundStyle(Palette.ok)
+            }
             if p.duty < 0.98 {
                 Label("\(Int(p.duty * 100))%", systemImage: "pause.fill")
                     .font(.caption2).foregroundStyle(Palette.accent)
@@ -296,7 +325,7 @@ struct ProcessListView: View {
                 Image(systemName: "shield.fill").font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
-            Text("\(Int(p.demandCPU))% cpu").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            Text(String(format: "%.1f W", p.estWatts)).font(.caption).foregroundStyle(.secondary).monospacedDigit()
 
         }
         .font(.callout)
@@ -314,9 +343,49 @@ struct ProcessListView: View {
 private struct FooterView: View {
     let model: PowerModel
 
+    @ViewBuilder
+    private var helperItems: some View {
+        switch model.report.helper {
+        case .notInstalled:
+            Button("Install helper for hard limits…") { model.installHelper() }.disabled(model.helperBusy)
+        case .unreachable:
+            Text("Helper installed, not responding")
+            Button("Reinstall helper…") { model.installHelper() }.disabled(model.helperBusy)
+            Button("Remove helper…") { model.uninstallHelper() }.disabled(model.helperBusy)
+        case .outdated:
+            Button("Update helper…") { model.installHelper() }.disabled(model.helperBusy)
+            Button("Remove helper…") { model.uninstallHelper() }.disabled(model.helperBusy)
+        case .connected(let caps):
+            Toggle("Pause charging when over the cap", isOn: Binding(get: { model.pauseCharging }, set: { model.setPauseCharging($0) }))
+                .disabled(!caps.charge)
+            Toggle("Low Power Mode when over the cap", isOn: Binding(get: { model.lowPowerMode }, set: { model.setLowPowerMode($0) }))
+                .disabled(!caps.lowPower)
+            Toggle("Run from battery as a last resort", isOn: Binding(get: { model.batteryBackstop }, set: { model.setBatteryBackstop($0) }))
+                .disabled(!caps.adapter)
+            Button("Remove helper…") { model.uninstallHelper() }.disabled(model.helperBusy)
+        }
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             Menu {
+                Menu("Display dimming") {
+                    Picker("Dim no lower than", selection: Binding(get: { model.dimFloor }, set: { model.setDimFloor($0) })) {
+                        Text("Never dim").tag(0.0)
+                        ForEach([0.7, 0.5, 0.4, 0.3, 0.2], id: \.self) { Text("\(Int($0 * 100))%").tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                }
+                Menu("Adapter efficiency") {
+                    Picker("Wall estimate", selection: Binding(get: { model.efficiency }, set: { model.setEfficiency($0) })) {
+                        Text("Auto (conservative)").tag(0.0)
+                        ForEach([0.85, 0.88, 0.90, 0.92, 0.94], id: \.self) { Text("\(Int($0 * 100))%").tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                }
+                Divider()
+                helperItems
+                Divider()
                 Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
                 Toggle("Show in Dock", isOn: Binding(get: { model.showInDock }, set: { model.setShowInDock($0) }))
                 Divider()
@@ -349,7 +418,8 @@ private struct FooterView: View {
             .help("Update rate of the displayed wattage")
 
             Spacer()
-            Text("Software cap · ±5 W").font(.caption2).foregroundStyle(.tertiary)
+            Text(model.strict ? "Strict · peaks held under the cap" : "Software cap · ~±2 W")
+                .font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(.top, 2)
     }
