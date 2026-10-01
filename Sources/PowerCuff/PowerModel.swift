@@ -33,12 +33,24 @@ final class PowerModel {
     private(set) var showInDock: Bool
     private(set) var launchAtLogin: Bool
     private(set) var refreshSeconds: Double
+    private(set) var strict: Bool
+    /// Lowest brightness the governor may dim to; 0 = never dim.
+    private(set) var dimFloor: Double
+    private(set) var pauseCharging: Bool
+    private(set) var lowPowerMode: Bool
+    private(set) var batteryBackstop: Bool
+    /// Fixed adapter efficiency for the wall estimate; 0 = automatic (conservative model).
+    private(set) var efficiency: Double
+    private(set) var helperBusy = false
 
     @ObservationIgnored private let governor = Governor()
     /// Governor work (process sampling, signals) never blocks the display reads.
     @ObservationIgnored private let controlQueue = DispatchQueue(label: "app.powercuff.governor", qos: .userInitiated)
     @ObservationIgnored private let displayQueue = DispatchQueue(label: "app.powercuff.display", qos: .userInitiated)
-    @ObservationIgnored private var controlTimer: Timer?
+    @ObservationIgnored private var controlTimer: DispatchSourceTimer?
+    @ObservationIgnored private var controlPeriod = 0.0
+    @ObservationIgnored private let shared = SharedConfig()
+    @ObservationIgnored private var lastPublish = Date.distantPast
     @ObservationIgnored private var displayTimer: Timer?
     @ObservationIgnored private var persistTask: Task<Void, Never>?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
@@ -58,8 +70,26 @@ final class PowerModel {
         launchAtLogin = SMAppService.mainApp.status == .enabled
         let r = d.object(forKey: "refreshSeconds") as? Double ?? RefreshRate.standard
         refreshSeconds = RefreshRate.options.contains(r) ? r : RefreshRate.standard
+        strict = d.bool(forKey: "strict")
+        dimFloor = d.object(forKey: "dimFloor") as? Double ?? 0.4
+        pauseCharging = d.object(forKey: "pauseCharging") as? Bool ?? true
+        lowPowerMode = d.object(forKey: "lowPowerMode") as? Bool ?? true
+        batteryBackstop = d.object(forKey: "batteryBackstop") as? Bool ?? true
+        efficiency = d.double(forKey: "efficiency")
         start()
     }
+
+    var config: GovernorConfig {
+        var c = GovernorConfig()
+        c.capW = capW; c.enabled = enabled; c.strict = strict; c.excluded = excluded
+        c.dimFloor = dimFloor > 0 ? dimFloor : nil
+        c.pauseCharging = pauseCharging; c.lowPowerMode = lowPowerMode; c.batteryBackstop = batteryBackstop
+        c.efficiency = efficiency > 0 ? efficiency : nil
+        return c
+    }
+
+    /// Settings the control queue reads without hopping to the main actor.
+    private func pushConfig() { shared.set(config) }
 
     // MARK: intents
 
@@ -68,6 +98,7 @@ final class PowerModel {
         let v = min(max(w.rounded(), Self.capRange.lowerBound), Self.capRange.upperBound)
         guard v != capW else { return }
         capW = v
+        pushConfig()
         persistTask?.cancel()
         persistTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
@@ -79,7 +110,21 @@ final class PowerModel {
     func setEnabled(_ on: Bool) {
         enabled = on
         defaults.set(on, forKey: "enabled")
-        controlTick()
+        pushConfig()
+        controlQueue.async { [self] in controlTick() }
+    }
+
+    func setStrict(_ on: Bool) { strict = on; defaults.set(on, forKey: "strict"); pushConfig() }
+    func setDimFloor(_ v: Double) { dimFloor = v; defaults.set(v, forKey: "dimFloor"); pushConfig() }
+    func setPauseCharging(_ on: Bool) { pauseCharging = on; defaults.set(on, forKey: "pauseCharging"); pushConfig() }
+    func setLowPowerMode(_ on: Bool) { lowPowerMode = on; defaults.set(on, forKey: "lowPowerMode"); pushConfig() }
+    func setBatteryBackstop(_ on: Bool) { batteryBackstop = on; defaults.set(on, forKey: "batteryBackstop"); pushConfig() }
+
+    func setEfficiency(_ v: Double) {
+        efficiency = v
+        defaults.set(v, forKey: "efficiency")
+        pushConfig()
+        displayTick()
     }
 
     func setRefresh(_ seconds: Double) {
@@ -91,6 +136,29 @@ final class PowerModel {
     func toggleExcluded(_ name: String) {
         if excluded.contains(name) { excluded.remove(name) } else { excluded.insert(name) }
         defaults.set(Array(excluded), forKey: "excluded")
+        pushConfig()
+    }
+
+    // MARK: helper
+
+    var helperInstalled: Bool { report.helper != .notInstalled }
+
+    /// Installs (or updates) the root helper for the hard levers. macOS asks for an administrator password.
+    func installHelper() { runHelperScript(HelperInstaller.installScript(helper: HelperInstaller.bundledHelperPath)) }
+    func uninstallHelper() { runHelperScript(HelperInstaller.uninstallScript) }
+
+    private func runHelperScript(_ script: String?) {
+        guard let script, !helperBusy else { return }
+        helperBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = HelperInstaller.runAsAdmin(script)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.helperBusy = false
+                    if !ok { NSLog("PowerCuff: helper script cancelled or failed") }
+                }
+            }
+        }
     }
 
     func setShowInDock(_ on: Bool) {
@@ -112,12 +180,13 @@ final class PowerModel {
     /// the governor can no longer throttle anything.
     func shutdown() {
         isShutDown = true
-        controlTimer?.invalidate(); controlTimer = nil
+        controlTimer?.cancel(); controlTimer = nil
         displayTimer?.invalidate(); displayTimer = nil
         persistTask?.cancel()
         defaults.set(capW, forKey: "capW")
         observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         observers = []
+        shared.kill()
         governor.shutdown()
     }
 
@@ -130,7 +199,13 @@ final class PowerModel {
 
     private func start() {
         let nc = NSWorkspace.shared.notificationCenter
+        pushConfig()
+        shared.setFront(NSWorkspace.shared.frontmostApplication?.processIdentifier)
         observers = [
+            nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+                let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                MainActor.assumeIsolated { self?.shared.setFront(app?.processIdentifier) }
+            },
             nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.pause() }
             },
@@ -147,7 +222,7 @@ final class PowerModel {
     /// Before sleep nothing may stay frozen.
     private func pause() {
         isSleeping = true
-        controlTimer?.invalidate(); controlTimer = nil
+        controlTimer?.cancel(); controlTimer = nil
         displayTimer?.invalidate(); displayTimer = nil
         controlQueue.async { [governor] in governor.releaseThrottles() }
     }
@@ -155,14 +230,9 @@ final class PowerModel {
     private func resume() {
         guard !isShutDown else { return }
         isSleeping = false
-        controlTimer?.invalidate()
-        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.controlTick() }
-        }
-        t.tolerance = 0.05
-        RunLoop.main.add(t, forMode: .common)
-        controlTimer = t
-        controlTick()
+        controlTimer?.cancel()
+        controlTimer = nil
+        controlQueue.async { [self] in controlTick() }
         startDisplayTimer()
     }
 
@@ -179,34 +249,53 @@ final class PowerModel {
         displayTick()
     }
 
-    /// Fixed 1 Hz: the controller is tuned for it, whatever rate is shown.
-    private func controlTick() {
-        guard !isShutDown, !isSleeping else { return }
-        let cap = capW, on = enabled, ex = excluded
-        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        controlQueue.async { [governor] in
-            let snap = BatteryReader.read()
-            let rep = governor.tick(snapshot: snap, capW: cap, enabled: on, frontmostPID: front, excluded: ex)
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated { self.publish(report: rep) }
+    /// Runs on `controlQueue`: 5 Hz while enforcing (the controller is tuned for it), 1 Hz when only monitoring,
+    /// whatever rate is shown.
+    private nonisolated func controlTick() {
+        let (cfg, front, live) = shared.get()
+        guard live else { return }
+        let snap = BatteryReader.read(efficiency: cfg.efficiency)
+        let rep = governor.tick(snapshot: snap, config: cfg, frontmostPID: front)
+        let period = governor.interval(enabled: cfg.enabled)
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                self.publish(report: rep)
+                self.scheduleControl(period)
             }
         }
+    }
+
+    private func scheduleControl(_ period: Double) {
+        guard !isShutDown, !isSleeping, period != controlPeriod || controlTimer == nil else { return }
+        controlTimer?.cancel()
+        controlPeriod = period
+        let t = DispatchSource.makeTimerSource(queue: controlQueue)
+        t.schedule(deadline: .now() + period, repeating: period, leeway: .milliseconds(Int(period * 50)))
+        t.setEventHandler { [weak self] in self?.controlTick() }
+        t.resume()
+        controlTimer = t
     }
 
     private func displayTick() {
         guard !isShutDown, !isSleeping else { return }
         let window = min(refreshSeconds, SMCReader.maxWindow)
+        let eff = efficiency > 0 ? efficiency : nil
         displayQueue.async {
-            let snap = BatteryReader.read(window: window)
+            let snap = BatteryReader.read(window: window, efficiency: eff)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self.publish(snapshot: snap) }
             }
         }
     }
 
+    /// The fast estimate changes every tick; the UI only needs it about once a second.
     private func publish(report rep: GovernorReport) {
-        guard !isShutDown else { return }
-        if report != rep { report = rep }
+        guard !isShutDown, report != rep else { return }
+        let structural = rep.state != report.state || rep.levers != report.levers || rep.helper != report.helper
+            || rep.procs != report.procs
+        guard structural || Date().timeIntervalSince(lastPublish) >= 1 else { return }
+        report = rep
+        lastPublish = Date()
     }
 
     private func publish(snapshot snap: PowerSnapshot?) {
